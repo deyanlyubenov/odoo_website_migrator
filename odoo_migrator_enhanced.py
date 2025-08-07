@@ -187,18 +187,65 @@ class EnhancedOdooWebsiteMigrator:
         """Retrieve all website pages from the source instance."""
         try:
             self.logger.info("Retrieving website pages from source...")
-            pages = self.source_models.execute_kw(
+            
+            # First, get all website builder views that represent pages
+            builder_pages = self.source_models.execute_kw(
                 self.source_db, self.source_uid, self.source_password,
-                'website.page', 'search_read',
-                [[('is_published', '=', True)]],
+                'ir.ui.view', 'search_read',
+                [[('type', '=', 'qweb'), ('key', 'like', 'website.page%')]],
                 {
-                    'fields': [
-                        'name', 'url', 'is_published', 'website_id',
-                        'view_id', 'key', 'arch', 'arch_db'
-                    ]
+                    'fields': ['name', 'key', 'arch_db', 'arch', 'id']
                 }
             )
-            self.logger.info(f"Found {len(pages)} website pages")
+            self.logger.info(f"Found {len(builder_pages)} website builder pages")
+            
+            # Convert builder pages to page format
+            pages = []
+            for builder_page in builder_pages:
+                page_name = builder_page['name']
+                # Extract URL from key or create one
+                url = f'/{page_name.lower().replace(" ", "-").replace("_", "-")}'
+                if 'website.page.' in builder_page['key']:
+                    url_part = builder_page['key'].replace('website.page.', '')
+                    url = f'/{url_part}'
+                
+                pages.append({
+                    'name': page_name,
+                    'url': url,
+                    'is_published': True,
+                    'website_id': False,
+                    'view_id': builder_page['id'],
+                    'key': builder_page['key'],
+                    'arch': builder_page.get('arch'),
+                    'arch_db': builder_page.get('arch_db'),
+                    'is_builder_page': True
+                })
+            
+            # Also get regular website pages
+            try:
+                regular_pages = self.source_models.execute_kw(
+                    self.source_db, self.source_uid, self.source_password,
+                    'website.page', 'search_read',
+                    [[('is_published', '=', True)]],
+                    {
+                        'fields': [
+                            'name', 'url', 'is_published', 'website_id',
+                            'view_id', 'key', 'arch', 'arch_db'
+                        ]
+                    }
+                )
+                
+                # Add regular pages that don't conflict with builder pages
+                for regular_page in regular_pages:
+                    existing_page = next((p for p in pages if p['name'] == regular_page['name']), None)
+                    if not existing_page:
+                        regular_page['is_builder_page'] = False
+                        pages.append(regular_page)
+                        
+            except Exception as e:
+                self.logger.warning(f"Could not retrieve regular website pages: {str(e)}")
+            
+            self.logger.info(f"Found {len(pages)} total website pages")
             return pages
         except Exception as e:
             self.logger.error(f"Error retrieving website pages: {str(e)}")
@@ -434,8 +481,68 @@ class EnhancedOdooWebsiteMigrator:
                     page_data['arch_db'] = page['arch_db']
                 elif 'arch' in page and page['arch']:
                     page_data['arch'] = page['arch']
+                else:
+                    # Create a minimal architecture if none exists
+                    safe_name = page["name"].replace(" ", "_").replace("-", "_").lower()
+                    page_data['arch'] = f'<t t-name="page_{safe_name}"><div class="container"><h1>{page["name"]}</h1><p>Content for {page["name"]}</p></div></t>'
                 
-                # Create page in target
+                # Remove any problematic fields that might cause issues
+                if 'view_id' in page_data and not page_data['view_id']:
+                    del page_data['view_id']
+                
+
+                
+                # Handle builder pages differently
+                if page.get('is_builder_page', False):
+                    # For builder pages, create the view first, then the page
+                    if page.get('arch_db') or page.get('arch'):
+                        # Create the view in target
+                        view_data = {
+                            'name': page['name'],
+                            'type': 'qweb',
+                            'key': page['key'],
+                            'arch': page.get('arch', ''),
+                            'arch_db': page.get('arch_db', '')
+                        }
+                        
+                        new_view_id = self.target_models.execute_kw(
+                            self.target_db, self.target_uid, self.target_password,
+                            'ir.ui.view', 'create',
+                            [view_data]
+                        )
+                        
+                        # Create page with view reference
+                        page_data = {
+                            'name': page['name'],
+                            'url': page['url'],
+                            'is_published': page.get('is_published', True),
+                            'view_id': new_view_id
+                        }
+                    else:
+                        # Create basic page without view
+                        page_data = {
+                            'name': page['name'],
+                            'url': page['url'],
+                            'is_published': page.get('is_published', True),
+                        }
+                else:
+                    # For regular pages, use the existing logic
+                    page_data = {
+                        'name': page['name'],
+                        'url': page['url'],
+                        'is_published': page.get('is_published', True),
+                    }
+                    
+                    # Add architecture if available
+                    if 'arch_db' in page and page['arch_db']:
+                        page_data['arch_db'] = page['arch_db']
+                    elif 'arch' in page and page['arch']:
+                        page_data['arch'] = page['arch']
+                    else:
+                        # Create a minimal architecture if none exists
+                        safe_name = page["name"].replace(" ", "_").replace("-", "_").lower()
+                        page_data['arch'] = f'<t t-name="page_{safe_name}"><div class="container"><h1>{page["name"]}</h1><p>Content for {page["name"]}</p></div></t>'
+                
                 new_page_id = self.target_models.execute_kw(
                     self.target_db, self.target_uid, self.target_password,
                     'website.page', 'create',
@@ -445,10 +552,128 @@ class EnhancedOdooWebsiteMigrator:
                 self.logger.info(f"Successfully migrated page: {page['name']} (ID: {new_page_id})")
                 self.migration_stats['pages_migrated'] += 1
                 
+                # Try to migrate the associated view if it exists
+                if page.get('view_id'):
+                    self.migrate_page_view(page['view_id'], new_page_id)
+                
+                # Try to migrate additional page content (only for non-builder pages)
+                if not page.get('is_builder_page', False):
+                    self.migrate_page_content(page['id'], new_page_id)
+                
+                # Try to migrate builder content
+                self.migrate_page_builder_content(page['name'], new_page_id)
+                
             except Exception as e:
                 error_msg = f"Error migrating page {page.get('name', 'Unknown')}: {str(e)}"
                 self.logger.error(error_msg)
                 self.migration_stats['errors'].append(error_msg)
+    
+    def migrate_page_view(self, view_id: int, new_page_id: int):
+        """Migrate the view associated with a page."""
+        try:
+            # Get the view from source
+            view = self.source_models.execute_kw(
+                self.source_db, self.source_uid, self.source_password,
+                'ir.ui.view', 'read',
+                [view_id],
+                {'fields': ['name', 'type', 'arch', 'arch_fs', 'key', 'inherit_id']}
+            )
+            
+            if view:
+                view_data = view[0]
+                
+                # Create the view in target
+                new_view_data = {
+                    'name': view_data['name'],
+                    'type': view_data['type'],
+                    'arch': view_data.get('arch', ''),
+                    'key': view_data.get('key', ''),
+                }
+                
+                # Create view in target
+                new_view_id = self.target_models.execute_kw(
+                    self.target_db, self.target_uid, self.target_password,
+                    'ir.ui.view', 'create',
+                    [new_view_data]
+                )
+                
+                # Update the page to reference the new view
+                self.target_models.execute_kw(
+                    self.target_db, self.target_uid, self.target_password,
+                    'website.page', 'write',
+                    [[new_page_id], {'view_id': new_view_id}]
+                )
+                
+                self.logger.info(f"Successfully migrated view for page (View ID: {new_view_id})")
+                
+        except Exception as e:
+            self.logger.warning(f"Could not migrate view for page: {str(e)}")
+    
+    def migrate_page_content(self, page_id: int, new_page_id: int):
+        """Migrate the content of a page from website builder."""
+        try:
+            # Get page content from source
+            page_content = self.source_models.execute_kw(
+                self.source_db, self.source_uid, self.source_password,
+                'website.page', 'read',
+                [page_id],
+                {'fields': ['arch_db', 'arch']}
+            )
+            
+            if page_content:
+                content_data = page_content[0]
+                update_data = {}
+                
+                # Update architecture if available
+                if content_data.get('arch_db'):
+                    update_data['arch_db'] = content_data['arch_db']
+                elif content_data.get('arch'):
+                    update_data['arch'] = content_data['arch']
+                
+                # Update the page in target
+                if update_data:
+                    self.target_models.execute_kw(
+                        self.target_db, self.target_uid, self.target_password,
+                        'website.page', 'write',
+                        [[new_page_id], update_data]
+                    )
+                    
+                    self.logger.info(f"Successfully migrated content for page (ID: {new_page_id})")
+                
+        except Exception as e:
+            self.logger.warning(f"Could not migrate content for page: {str(e)}")
+    
+    def migrate_page_builder_content(self, page_name: str, new_page_id: int):
+        """Migrate the content of a page from website builder views."""
+        try:
+            # Get page content from website builder views
+            builder_views = self.source_models.execute_kw(
+                self.source_db, self.source_uid, self.source_password,
+                'ir.ui.view', 'search_read',
+                [[('type', '=', 'qweb'), ('name', '=', page_name)]],
+                {'fields': ['arch_db', 'arch']}
+            )
+            
+            if builder_views:
+                view_data = builder_views[0]
+                update_data = {}
+                
+                # Update architecture if available
+                if view_data.get('arch_db'):
+                    update_data['arch_db'] = view_data['arch_db']
+                elif view_data.get('arch'):
+                    update_data['arch'] = view_data['arch']
+                
+                if update_data:
+                    self.target_models.execute_kw(
+                        self.target_db, self.target_uid, self.target_password,
+                        'website.page', 'write',
+                        [[new_page_id], update_data]
+                    )
+                    self.logger.info(f"Updated page {page_name} with builder content")
+                    
+        except Exception as e:
+            self.logger.warning(f"Could not migrate builder content for page {page_name}: {str(e)}")
     
     def migrate_website_menus(self, menus: List[Dict[str, Any]]):
         """Migrate website menus to the target instance."""
