@@ -71,6 +71,7 @@ class EnhancedOdooWebsiteMigrator:
         
         # Migration statistics
         self.migration_stats = {
+            'websites_migrated': 0,
             'pages_migrated': 0,
             'menus_migrated': 0,
             'themes_migrated': 0,
@@ -164,6 +165,9 @@ class EnhancedOdooWebsiteMigrator:
     def get_website_data(self) -> Dict[str, List[Dict[str, Any]]]:
         """Retrieve all website data from the source instance."""
         data = {}
+        
+        if self.migration_options.get('migrate_websites', True):
+            data['websites'] = self.get_websites()
         
         if self.migration_options.get('migrate_pages', True):
             data['pages'] = self.get_website_pages()
@@ -261,8 +265,37 @@ class EnhancedOdooWebsiteMigrator:
             self.migration_stats['errors'].append(f"Website assets: {str(e)}")
             return []
     
+    def get_websites(self) -> List[Dict[str, Any]]:
+        """Retrieve all websites from the source instance."""
+        try:
+            self.logger.info("Retrieving websites from source...")
+            websites = self.source_models.execute_kw(
+                self.source_db, self.source_uid, self.source_password,
+                'website', 'search_read',
+                [[]],
+                {
+                    'fields': [
+                        'name', 'domain', 'company_id', 'default_lang_id',
+                        'social_twitter', 'social_facebook', 'social_github',
+                        'social_linkedin', 'social_youtube', 'social_instagram',
+                        'google_analytics_key', 'google_maps_api_key',
+                        'cdn_activated', 'cdn_url', 'cdn_filters',
+                        'favicon', 'logo', 'theme_id'
+                    ]
+                }
+            )
+            self.logger.info(f"Found {len(websites)} websites")
+            return websites
+        except Exception as e:
+            self.logger.error(f"Error retrieving websites: {str(e)}")
+            self.migration_stats['errors'].append(f"Websites: {str(e)}")
+            return []
+    
     def migrate_website_data(self, data: Dict[str, List[Dict[str, Any]]]):
         """Migrate all website data to the target instance."""
+        if 'websites' in data:
+            self.migrate_websites(data['websites'])
+        
         if 'pages' in data:
             self.migrate_website_pages(data['pages'])
         
@@ -274,6 +307,101 @@ class EnhancedOdooWebsiteMigrator:
         
         if 'assets' in data:
             self.migrate_website_assets(data['assets'])
+    
+    def migrate_websites(self, websites: List[Dict[str, Any]]):
+        """Migrate websites to the target instance."""
+        self.logger.info("Starting websites migration...")
+        
+        for website in websites:
+            try:
+                # Check if website already exists
+                if self.migration_options.get('skip_existing', True):
+                    existing_website = self.target_models.execute_kw(
+                        self.target_db, self.target_uid, self.target_password,
+                        'website', 'search_read',
+                        [[('name', '=', website['name'])]],
+                        {'fields': ['id']}
+                    )
+                    
+                    if existing_website:
+                        self.logger.info(f"Website {website['name']} already exists, skipping...")
+                        continue
+                
+                # Prepare website data for migration
+                website_data = {
+                    'name': website['name'],
+                    'domain': website.get('domain', ''),
+                    'social_twitter': website.get('social_twitter', ''),
+                    'social_facebook': website.get('social_facebook', ''),
+                    'social_github': website.get('social_github', ''),
+                    'social_linkedin': website.get('social_linkedin', ''),
+                    'social_youtube': website.get('social_youtube', ''),
+                    'social_instagram': website.get('social_instagram', ''),
+                    'google_analytics_key': website.get('google_analytics_key', ''),
+                    'google_maps_api_key': website.get('google_maps_api_key', ''),
+                    'cdn_activated': website.get('cdn_activated', False),
+                    'cdn_url': website.get('cdn_url', ''),
+                    'cdn_filters': website.get('cdn_filters', ''),
+                }
+                
+                # Create website in target
+                new_website_id = self.target_models.execute_kw(
+                    self.target_db, self.target_uid, self.target_password,
+                    'website', 'create',
+                    [website_data]
+                )
+                
+                self.logger.info(f"Successfully migrated website: {website['name']} (ID: {new_website_id})")
+                self.migration_stats['websites_migrated'] += 1
+                
+                # Also migrate website settings and configurations
+                self.migrate_website_settings(website, new_website_id)
+                
+            except Exception as e:
+                error_msg = f"Error migrating website {website.get('name', 'Unknown')}: {str(e)}"
+                self.logger.error(error_msg)
+                self.migration_stats['errors'].append(error_msg)
+    
+    def migrate_website_settings(self, website: Dict[str, Any], new_website_id: int):
+        """Migrate website settings and configurations."""
+        try:
+            self.logger.info(f"Migrating settings for website: {website['name']}")
+            
+            # Migrate website theme settings
+            if website.get('theme_id'):
+                try:
+                    # Try to set the theme for the new website
+                    self.target_models.execute_kw(
+                        self.target_db, self.target_uid, self.target_password,
+                        'website', 'write',
+                        [[new_website_id], {'theme_id': website['theme_id'][0]}]
+                    )
+                    self.logger.info(f"Applied theme to website: {website['name']}")
+                except Exception as e:
+                    self.logger.warning(f"Could not apply theme to website {website['name']}: {str(e)}")
+            
+            # Migrate website configuration settings
+            config_data = {
+                'google_analytics_key': website.get('google_analytics_key', ''),
+                'google_maps_api_key': website.get('google_maps_api_key', ''),
+                'cdn_activated': website.get('cdn_activated', False),
+                'cdn_url': website.get('cdn_url', ''),
+                'cdn_filters': website.get('cdn_filters', ''),
+            }
+            
+            # Update website with additional settings
+            self.target_models.execute_kw(
+                self.target_db, self.target_uid, self.target_password,
+                'website', 'write',
+                [[new_website_id], config_data]
+            )
+            
+            self.logger.info(f"Successfully migrated settings for website: {website['name']}")
+            
+        except Exception as e:
+            error_msg = f"Error migrating settings for website {website.get('name', 'Unknown')}: {str(e)}"
+            self.logger.error(error_msg)
+            self.migration_stats['errors'].append(error_msg)
     
     def migrate_website_pages(self, pages: List[Dict[str, Any]]):
         """Migrate website pages to the target instance."""
@@ -473,6 +601,7 @@ Source: {self.source_url} ({self.source_db})
 Target: {self.target_url} ({self.target_db})
 
 Migration Statistics:
+- Websites migrated: {self.migration_stats['websites_migrated']}
 - Pages migrated: {self.migration_stats['pages_migrated']}
 - Menus migrated: {self.migration_stats['menus_migrated']}
 - Themes migrated: {self.migration_stats['themes_migrated']}
@@ -480,6 +609,7 @@ Migration Statistics:
 
 Migration Options Used:
 - Skip existing: {self.migration_options.get('skip_existing', True)}
+- Migrate websites: {self.migration_options.get('migrate_websites', True)}
 - Migrate pages: {self.migration_options.get('migrate_pages', True)}
 - Migrate menus: {self.migration_options.get('migrate_menus', True)}
 - Migrate themes: {self.migration_options.get('migrate_themes', True)}
