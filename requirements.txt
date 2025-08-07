@@ -1,0 +1,21 @@
+# Odoo Website Migrator Requirements
+# This tool uses only Python standard library modules
+# No additional dependencies are required
+
+# Python version requirement
+# Python >= 3.7
+
+# Standard library modules used:
+# - xmlrpc.client (for Odoo XML-RPC communication)
+# - json (for configuration file handling)
+# - logging (for detailed logging)
+# - sys (for system operations)
+# - os (for file operations)
+# - datetime (for timestamps)
+# - typing (for type hints)
+# - argparse (for command line argument parsing)
+# - getpass (for secure password input)
+# - shutil (for file operations)
+
+# All these modules are included in Python standard library
+# No pip install required
